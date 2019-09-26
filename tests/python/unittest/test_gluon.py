@@ -21,6 +21,7 @@ import tempfile
 import mxnet as mx
 from mxnet import gluon
 from mxnet.gluon import nn
+from mxnet.base import py_str
 from mxnet.test_utils import assert_almost_equal
 from mxnet.ndarray.ndarray import _STORAGE_TYPE_STR_TO_ID
 from common import (setup_module, with_seed, assertRaises, teardown,
@@ -115,7 +116,7 @@ def test_parameter_dict():
     params1.get('w1', shape=(10, 10), stype='row_sparse')
     params1.load('test_parameter_dict.params', ctx)
     trainer1 = mx.gluon.Trainer(params1, 'sgd')
-    
+
     # compare the values before and after save/load
     cur_w0 = params1.get('w0').data(ctx)
     cur_w1 = params1.get('w1').row_sparse_data(all_row_ids)
@@ -134,7 +135,21 @@ def test_parameter_dict():
     cur_w1 = params2.get('w1').data(ctx)
     mx.test_utils.assert_almost_equal(prev_w0.asnumpy(), cur_w0.asnumpy())
     mx.test_utils.assert_almost_equal(prev_w1.asnumpy(), cur_w1.asnumpy())
-    
+
+    # test reset_ctx
+    params3 = gluon.ParameterDict('net_')
+    params3.get('w0', shape=(10, 10))
+    params3.get('w1', shape=(10, 10))
+    params3.initialize(ctx=ctx)
+    list_contexts = [mx.cpu(42), mx.cpu(24)]
+    params3.reset_ctx(list_contexts)
+    for p in params3.values():
+        assert set(p.list_ctx()) == set(list_contexts)
+
+    # and test list_ctx
+    assert set(params3.list_ctx()) == set(list_contexts)
+
+
     # test the dtype casting functionality
     params0 = gluon.ParameterDict('')
     params0.get('w0', shape=(10, 10), dtype='float32')
@@ -386,7 +401,7 @@ def test_symbol_block():
         if 'conv' in param_name and 'weight' in param_name:
             break
     assert np.dtype(net_fp64.params[param_name].dtype) == np.dtype(np.float64)
-    
+
     # 3.b Verify same functionnality with the imports API
     net_fp_64 = mx.gluon.SymbolBlock.imports(sym_file, 'data', params_file, ctx=ctx)
 
@@ -742,6 +757,15 @@ def test_layernorm():
     layer = nn.LayerNorm(in_channels=10)
     check_layer_forward(layer, (2, 10, 10, 10))
 
+
+@with_seed()
+def test_groupnorm():
+    layer = nn.GroupNorm()
+    check_layer_forward(layer, (2, 10, 10, 10))
+    layer = nn.GroupNorm(num_groups=2)
+    check_layer_forward(layer, (2, 10, 10, 10))
+    layer = nn.GroupNorm(num_groups=5)
+    check_layer_forward(layer, (2, 10, 10, 10))
 
 @with_seed()
 def test_reflectionpad():
@@ -1213,7 +1237,7 @@ def test_activations():
         return [elu(x_i) for x_i in x]
 
     for test_point, ref_point in zip(elu_test(point_to_validate), elu(point_to_validate)):
-        assert test_point == ref_point
+        assert_almost_equal(test_point.asnumpy(), ref_point.asnumpy())
 
     selu = mx.gluon.nn.SELU()
     def selu_test(x):
@@ -1493,6 +1517,74 @@ def test_hook():
     block(mx.nd.ones((3, 5)))
     assert hook_call_count == 1
     assert pre_hook_call_count == 2
+
+@with_seed()
+def test_op_hook_output_names():
+    def check_name(block, expected_names, inputs=None, expected_opr_names=None, monitor_all=False):
+        opr_names = []
+        output_names = []
+
+        def mon_callback(node_name, opr_name, arr):
+            output_names.append(py_str(node_name))
+            opr_names.append(py_str(opr_name))
+
+        block.register_op_hook(mon_callback, monitor_all)
+        if not inputs:
+            block(mx.nd.ones((2, 3, 4)))
+        else:
+            block(inputs)
+
+        for output_name, expected_name in zip(output_names, expected_names):
+            print(output_name)
+            assert output_name == expected_name
+
+        if expected_opr_names:
+            for opr_name, expected_opr_name in zip(opr_names, expected_opr_names):
+                assert opr_name == expected_opr_name
+
+    # Test with Dense layer
+    model = mx.gluon.nn.HybridSequential(prefix="dense_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.Dense(2))
+    model.initialize()
+    model.hybridize()
+    check_name(model, ["dense_dense0_fwd_output"])
+
+    # Test with Activation, FListInputNames not registered, input name will have _input appended
+    model = mx.gluon.nn.HybridSequential(prefix="relu_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.Activation("relu"))
+    model.initialize()
+    model.hybridize()
+    check_name(model, ["relu_relu0_fwd_output"])
+
+    # Test with Pooling, monitor_all is set to True
+    model = mx.gluon.nn.HybridSequential("pool_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.AvgPool1D())
+    model.initialize()
+    model.hybridize()
+    check_name(model, ['pool_pool0_fwd_data', 'pool_pool0_fwd_output'], expected_opr_names=["Pooling"],
+               monitor_all=True)
+
+    # stack two layers and test
+    model = mx.gluon.nn.HybridSequential("dense_")
+    with model.name_scope():
+        model.add(mx.gluon.nn.Dense(2))
+        model.add(mx.gluon.nn.Activation("relu"))
+    model.initialize()
+    model.hybridize()
+    check_name(model,
+               ['dense_dense0_fwd_data', 'dense_dense0_fwd_weight',
+                'dense_dense0_fwd_bias', 'dense_dense0_fwd_output',
+                'dense_relu0_fwd_input0', 'dense_relu0_fwd_output'], monitor_all=True)
+
+    # check with different hybridize modes
+    model.hybridize(static_alloc=True)
+    check_name(model,
+               ['dense_dense0_fwd_data', 'dense_dense0_fwd_weight',
+                'dense_dense0_fwd_bias', 'dense_dense0_fwd_output',
+                'dense_relu0_fwd_input0', 'dense_relu0_fwd_output'], monitor_all=True)
 
 
 @with_seed()
@@ -2779,7 +2871,7 @@ def test_gluon_param_load():
     net.cast('float16')
     net.load_parameters('test_gluon_param_load.params', cast_dtype=True)
     mx.nd.waitall()
-    
+
 @with_seed()
 def test_gluon_param_load_dtype_source():
     net = mx.gluon.nn.Dense(10, in_units=10)
@@ -2790,6 +2882,22 @@ def test_gluon_param_load_dtype_source():
     net.load_parameters('test_gluon_param_load_dtype_source.params', cast_dtype=True, dtype_source="saved")
     assert net.weight.dtype == np.float16
     mx.nd.waitall()
+
+@with_seed()
+def test_squeeze_consistency():
+    class Foo(gluon.HybridBlock):
+        def __init__(self, inplace, **kwargs):
+            super(Foo, self).__init__(**kwargs)
+            self.inplace = inplace
+
+        def forward(self, x):
+            return x.squeeze(inplace=self.inplace)
+
+    for inplace in (True, False):
+        block = Foo(inplace)
+        block.hybridize()
+        shape = (np.random.randint(1, 10), np.random.randint(1, 10), 1)
+        block(mx.nd.ones(shape))
 
 if __name__ == '__main__':
     import nose

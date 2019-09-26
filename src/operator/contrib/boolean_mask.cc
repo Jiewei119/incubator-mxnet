@@ -74,23 +74,6 @@ bool BooleanMaskBackStorageType(const nnvm::NodeAttrs& attrs,
   return true;
 }
 
-struct BooleanMaskForwardCPUKernel {
-  template<typename DType>
-  static void Map(int i,
-                  DType* out,
-                  const DType* data,
-                  const int32_t* idx,
-                  const size_t col_size) {
-    // i is row id already
-    int32_t prev = (i == 0) ? 0 : idx[i - 1];
-    int32_t curr = idx[i];
-    if (prev != curr) {
-      std::memcpy(out + prev * col_size, data + i * col_size, col_size * sizeof(DType));
-    }
-  }
-};
-
-
 struct BooleanMaskBackwardCPUWriteKernel {
   template<typename DType>
   static void Map(int i,
@@ -143,6 +126,7 @@ inline void BooleanMaskForward<cpu>(const nnvm::NodeAttrs& attrs,
   // set the output shape forcefully
   mxnet::TShape s = data.shape();
   s[axis] = valid_num;
+
   const_cast<NDArray &>(out).Init(s);
   // do the copy
   MSHADOW_TYPE_SWITCH(data.dtype(), DType, {
